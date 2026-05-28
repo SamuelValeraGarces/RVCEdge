@@ -31,10 +31,7 @@ BASE_MODELS_DIR = Path(__file__).parent.parent / "base_models"
 def get_engine() -> RVCEdgeEngine:
     global engine
     if engine is None:
-        engine = RVCEdgeEngine(
-            device="auto",
-            rmvpe_path=str(BASE_MODELS_DIR / "rmvpe.pt"),
-        )
+        engine = RVCEdgeEngine(device="auto")
     return engine
 
 
