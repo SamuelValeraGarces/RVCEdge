@@ -41,8 +41,10 @@ def get_engine() -> RVCEdgeEngine:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def scan_models():
-    pths = sorted(MODELS_DIR.glob("*.pth")) if MODELS_DIR.exists() else []
-    return [str(p) for p in pths]
+    if not MODELS_DIR.exists():
+        return []
+    files = sorted(list(MODELS_DIR.glob("*.pth")) + list(MODELS_DIR.glob("*.safetensors")))
+    return [str(p) for p in files]
 
 
 def scan_indexes():

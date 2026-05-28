@@ -205,7 +205,7 @@ class FFN(nn.Module):
 
 class Encoder(nn.Module):
     def __init__(self, hidden_channels, filter_channels, n_heads, n_layers,
-                 kernel_size=1, p_dropout=0.0, window_size=4, **kwargs):
+                 kernel_size=1, p_dropout=0.0, window_size=4, **kwargs):  # window_size inferred from checkpoint
         super().__init__()
         self.hidden_channels = hidden_channels
         self.filter_channels = filter_channels
@@ -249,7 +249,7 @@ class Encoder(nn.Module):
 
 class TextEncoder(nn.Module):
     def __init__(self, out_channels, hidden_channels, filter_channels, n_heads,
-                 n_layers, kernel_size, p_dropout, f0=True):
+                 n_layers, kernel_size, p_dropout, f0=True, window_size=4):
         super().__init__()
         self.out_channels = out_channels
         self.hidden_channels = hidden_channels
@@ -263,7 +263,7 @@ class TextEncoder(nn.Module):
         if f0:
             self.emb_pitch = nn.Embedding(256, hidden_channels)
         self.encoder = Encoder(hidden_channels, filter_channels, n_heads, n_layers,
-                                kernel_size, float(p_dropout))
+                                kernel_size, float(p_dropout), window_size=window_size)
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(self, phone, pitch, lengths):
@@ -291,7 +291,7 @@ class TextEncoder(nn.Module):
 class TextEncoder768(nn.Module):
     """v2 encoder — 768-dim ContentVec input."""
     def __init__(self, out_channels, hidden_channels, filter_channels, n_heads,
-                 n_layers, kernel_size, p_dropout, f0=True):
+                 n_layers, kernel_size, p_dropout, f0=True, window_size=4):
         super().__init__()
         self.out_channels = out_channels
         self.hidden_channels = hidden_channels
@@ -300,7 +300,7 @@ class TextEncoder768(nn.Module):
         if f0:
             self.emb_pitch = nn.Embedding(256, hidden_channels)
         self.encoder = Encoder(hidden_channels, filter_channels, n_heads, n_layers,
-                                kernel_size, float(p_dropout))
+                                kernel_size, float(p_dropout), window_size=window_size)
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(self, phone, pitch, lengths):
@@ -427,7 +427,7 @@ class ResidualCouplingBlock(nn.Module):
                                       dilation_rate, n_layers, gin_channels=gin_channels,
                                       mean_only=True)
             )
-            self.flows.append(nn.modules.activation.Flip())
+            self.flows.append(Flip())
 
     def forward(self, x, x_mask, g=None, reverse=False):
         flows = self.flows if not reverse else reversed(self.flows)
@@ -441,22 +441,24 @@ class ResidualCouplingBlock(nn.Module):
                 l.remove_weight_norm()
 
 
+class Flip(nn.Module):
+    def forward(self, x, *args, **kwargs):
+        return torch.flip(x, [1])
+
+
 class ResBlock1(nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
         super().__init__()
         self.convs1 = nn.ModuleList([
-            weight_norm(Conv1d(channels, channels, kernel_size, 1,
-                               dilation=dilation[i],
-                               padding=get_padding(kernel_size, dilation[i])))
+            Conv1d(channels, channels, kernel_size, 1,
+                   dilation=dilation[i], padding=get_padding(kernel_size, dilation[i]))
             for i in range(3)
         ])
         self.convs2 = nn.ModuleList([
-            weight_norm(Conv1d(channels, channels, kernel_size, 1,
-                               dilation=1, padding=get_padding(kernel_size, 1)))
+            Conv1d(channels, channels, kernel_size, 1,
+                   dilation=1, padding=get_padding(kernel_size, 1))
             for _ in range(3)
         ])
-        self.convs1.apply(init_weights)
-        self.convs2.apply(init_weights)
 
     def forward(self, x, x_mask=None):
         for c1, c2 in zip(self.convs1, self.convs2):
@@ -467,22 +469,15 @@ class ResBlock1(nn.Module):
             x = xt + x
         return x if x_mask is None else x * x_mask
 
-    def remove_weight_norm(self):
-        for l in self.convs1:
-            remove_weight_norm(l)
-        for l in self.convs2:
-            remove_weight_norm(l)
-
 
 class ResBlock2(nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3)):
         super().__init__()
         self.convs = nn.ModuleList([
-            weight_norm(Conv1d(channels, channels, kernel_size, 1,
-                               dilation=d, padding=get_padding(kernel_size, d)))
+            Conv1d(channels, channels, kernel_size, 1,
+                   dilation=d, padding=get_padding(kernel_size, d))
             for d in dilation
         ])
-        self.convs.apply(init_weights)
 
     def forward(self, x, x_mask=None):
         for c in self.convs:
@@ -490,10 +485,6 @@ class ResBlock2(nn.Module):
             xt = c(xt)
             x = xt + x
         return x if x_mask is None else x * x_mask
-
-    def remove_weight_norm(self):
-        for l in self.convs:
-            remove_weight_norm(l)
 
 
 class SineGen(nn.Module):
@@ -512,14 +503,20 @@ class SineGen(nn.Module):
         return (f0 > self.voiced_threshold).float()
 
     def forward(self, f0, upp):
+        # f0: [B, T] at frame rate — upsample to sample rate before computing sines
         with torch.no_grad():
-            f0 = f0[:, None].transpose(1, 2)
+            f0 = f0[:, None].transpose(1, 2)  # [B, T, 1]
             f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
             f0_buf[:, :, 0] = f0[:, :, 0]
             for i in range(self.harmonic_num):
                 f0_buf[:, :, i + 1] = f0_buf[:, :, 0] * (i + 2)
 
-            rad_values = (f0_buf / self.sampling_rate) % 1
+            # Upsample F0 to sample rate: [B, T*upp, dim]
+            f0_buf_up = F.interpolate(
+                f0_buf.transpose(1, 2), scale_factor=upp, mode="nearest"
+            ).transpose(1, 2)
+
+            rad_values = (f0_buf_up / self.sampling_rate) % 1
             rand_ini = torch.rand(f0_buf.shape[0], f0_buf.shape[2], device=f0_buf.device)
             rand_ini[:, 0] = 0
             rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
@@ -530,12 +527,14 @@ class SineGen(nn.Module):
             cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
             sines = torch.sin(
                 torch.cumsum(rad_values + cumsum_shift, dim=1) * 2 * math.pi
-            )
-            uv = self._f02uv(f0)
+            )  # [B, T*upp, dim]
+
+            uv = self._f02uv(f0)  # [B, T, 1]
             uv = F.interpolate(uv.transpose(2, 1), scale_factor=upp, mode="nearest").transpose(2, 1)
+            # uv: [B, T*upp, 1] — same length as sines now
             noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
             sines = uv * self.sine_amp * sines + noise_amp * torch.randn_like(sines)
-        return sines.transpose(1, 2)
+        return sines.transpose(1, 2)  # [B, dim, T*upp]
 
 
 class SourceModuleHnNSF(nn.Module):
@@ -556,7 +555,8 @@ class SourceModuleHnNSF(nn.Module):
 
 
 class GeneratorNSF(nn.Module):
-    """HiFi-GAN generator with Neural Source Filter conditioning."""
+    """HiFi-GAN generator with Neural Source Filter conditioning.
+    Plain (no weight_norm) — compose_weight_norm handles checkpoint format."""
     def __init__(self, initial_channel, resblock, resblock_kernel_sizes,
                  resblock_dilation_sizes, upsample_rates, upsample_initial_channel,
                  upsample_kernel_sizes, gin_channels, sr):
@@ -566,16 +566,16 @@ class GeneratorNSF(nn.Module):
         self.f0_upsamp = nn.Upsample(scale_factor=math.prod(upsample_rates))
         self.m_source = SourceModuleHnNSF(sr, harmonic_num=0)
         self.noise_convs = nn.ModuleList()
-        self.conv_pre = weight_norm(Conv1d(initial_channel, upsample_initial_channel, 7, 1, padding=3))
+        self.conv_pre = Conv1d(initial_channel, upsample_initial_channel, 7, 1, padding=3)
         resblock_cls = ResBlock1 if resblock == "1" else ResBlock2
 
         self.ups = nn.ModuleList()
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
-            self.ups.append(weight_norm(
+            self.ups.append(
                 ConvTranspose1d(upsample_initial_channel // (2 ** i),
                                 upsample_initial_channel // (2 ** (i + 1)),
                                 k, u, padding=(k - u) // 2)
-            ))
+            )
             c_cur = upsample_initial_channel // (2 ** (i + 1))
             if i + 1 < len(upsample_rates):
                 stride_f0 = math.prod(upsample_rates[i + 1:])
@@ -589,8 +589,7 @@ class GeneratorNSF(nn.Module):
             for j, (k, d) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
                 self.resblocks.append(resblock_cls(ch, k, d))
 
-        self.conv_post = weight_norm(Conv1d(ch, 1, 7, 1, padding=3, bias=False))
-        self.ups.apply(init_weights)
+        self.conv_post = Conv1d(ch, 1, 7, 1, padding=3, bias=False)
 
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
@@ -598,8 +597,7 @@ class GeneratorNSF(nn.Module):
         self.upp = math.prod(upsample_rates)
 
     def forward(self, x, f0, g=None):
-        har_source, _, _ = self.m_source(f0, self.upp)
-        har_source = har_source.transpose(1, 2)
+        har_source, _, _ = self.m_source(f0, self.upp)  # [B, 1, T*upp]
         x = self.conv_pre(x)
         if g is not None:
             x = x + self.cond(g)
@@ -621,12 +619,7 @@ class GeneratorNSF(nn.Module):
         return x
 
     def remove_weight_norm(self):
-        for l in self.ups:
-            remove_weight_norm(l)
-        for l in self.resblocks:
-            l.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
+        pass  # no weight_norm applied — compose_weight_norm handles checkpoint format
 
 
 class SynthesizerTrnMs256NSFsid(nn.Module):
@@ -639,13 +632,16 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
         super().__init__()
         self.inter_channels = inter_channels
         self.hidden_channels = hidden_channels
+        window_size = kwargs.get("window_size", 4)
+        flow_n_layers = kwargs.get("flow_n_layers", 4)
         self.enc_p = TextEncoder(inter_channels, hidden_channels, filter_channels,
-                                  n_heads, n_layers, kernel_size, p_dropout)
+                                  n_heads, n_layers, kernel_size, p_dropout,
+                                  window_size=window_size)
         self.dec = GeneratorNSF(inter_channels, resblock, resblock_kernel_sizes,
                                  resblock_dilation_sizes, upsample_rates,
                                  upsample_initial_channel, upsample_kernel_sizes,
                                  gin_channels=gin_channels, sr=sr)
-        self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4,
+        self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, flow_n_layers,
                                            gin_channels=gin_channels)
         self.emb_g = nn.Embedding(spk_embed_dim, gin_channels)
 
@@ -681,13 +677,16 @@ class SynthesizerTrnMs768NSFsid(nn.Module):
         super().__init__()
         self.inter_channels = inter_channels
         self.hidden_channels = hidden_channels
+        window_size = kwargs.get("window_size", 4)
+        flow_n_layers = kwargs.get("flow_n_layers", 4)
         self.enc_p = TextEncoder768(inter_channels, hidden_channels, filter_channels,
-                                     n_heads, n_layers, kernel_size, p_dropout)
+                                     n_heads, n_layers, kernel_size, p_dropout,
+                                     window_size=window_size)
         self.dec = GeneratorNSF(inter_channels, resblock, resblock_kernel_sizes,
                                  resblock_dilation_sizes, upsample_rates,
                                  upsample_initial_channel, upsample_kernel_sizes,
                                  gin_channels=gin_channels, sr=sr)
-        self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4,
+        self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, flow_n_layers,
                                            gin_channels=gin_channels)
         self.emb_g = nn.Embedding(spk_embed_dim, gin_channels)
 
@@ -758,58 +757,178 @@ class SynthesizerTrnMs768NSFsid_nono(nn.Module):
         return o, x_mask
 
 
-def load_rvc_model(pth_path: str, device: str = "cpu"):
+def compose_weight_norm(state_dict: dict) -> dict:
     """
-    Load a .pth RVC model, auto-detect v1/v2 and sample rate.
-    Returns (model, sr_int, is_half, version).
+    Convert weight_g + weight_v pairs into plain weight tensors.
+    Required because GeneratorNSF uses plain convs but checkpoints
+    may have been saved with weight_norm applied.
     """
-    checkpoint = torch.load(pth_path, map_location="cpu", weights_only=False)
+    import torch.nn.functional as F_nn
+    result = {}
+    skip = set()
 
-    if "config" in checkpoint:
-        cfg = checkpoint["config"]
-        version = checkpoint.get("version", "v1")
-        f0 = checkpoint.get("f0", 1)
-        sr_str = checkpoint.get("sr", "40k")
-        state_dict = checkpoint.get("weight", checkpoint)
-    else:
-        # Legacy format: just the state dict
-        state_dict = checkpoint
-        version = "v1"
-        f0 = 1
-        sr_str = "40k"
-        cfg = [1025, 32, 192, 192, 768, 2, 6, 3, 0, "1",
-               [3, 7, 11], [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
-               [10, 10, 2, 2], 512, [20, 20, 4, 4], 109, 256, "40k"]
+    # Find all weight_g/weight_v base names
+    wn_bases = set()
+    for k in state_dict:
+        if k.endswith('.weight_g'):
+            base = k[:-len('.weight_g')]
+            if base + '.weight_v' in state_dict:
+                wn_bases.add(base)
 
-    sr_map = {"16k": 16000, "32k": 32000, "40k": 40000, "48k": 48000}
-    sr_int = sr_map.get(str(sr_str), 40000)
-
-    if isinstance(cfg[-1], str):
-        sr_arg = sr_int
-        config_args = list(cfg[:-1]) + [sr_arg]
-    else:
-        config_args = list(cfg)
-
-    if version == "v1":
-        if f0:
-            model_cls = SynthesizerTrnMs256NSFsid
-        else:
-            model_cls = SynthesizerTrnMs256NSFsid_nono
-    else:
-        if f0:
-            model_cls = SynthesizerTrnMs768NSFsid
-        else:
-            model_cls = SynthesizerTrnMs768NSFsid_nono
-
-    net_g = model_cls(*config_args)
-
-    # Clean up state dict keys
-    cleaned = {}
     for k, v in state_dict.items():
-        k = k.replace("enc_q.", "")
-        cleaned[k] = v
+        if k in skip:
+            continue
+        base_g = k[:-len('.weight_g')] if k.endswith('.weight_g') else None
+        base_v = k[:-len('.weight_v')] if k.endswith('.weight_v') else None
 
-    net_g.load_state_dict(cleaned, strict=False)
+        if base_g is not None and base_g in wn_bases:
+            weight_v = state_dict[base_g + '.weight_v']
+            weight_g = v
+            norm_axes = tuple(range(1, weight_v.ndim))
+            result[base_g + '.weight'] = weight_g * F_nn.normalize(weight_v, dim=norm_axes)
+            skip.add(k)
+            skip.add(base_g + '.weight_v')
+        elif base_v is not None and base_v in wn_bases:
+            skip.add(k)  # handled by weight_g branch
+        else:
+            k_clean = k.replace("enc_q.", "")
+            result[k_clean] = v
+
+    return result
+
+
+def infer_config_from_state_dict(state_dict: dict) -> dict:
+    """
+    Auto-detect RVC model config from state dict (for safetensors / legacy .pth).
+    Returns dict with version, f0, sr, config list.
+    """
+    import re
+
+    # Version: v2 = 768-dim emb_phone, v1 = 256-dim
+    phone_w = state_dict.get("enc_p.emb_phone.weight")
+    if phone_w is not None:
+        version = "v2" if phone_w.shape[1] == 768 else "v1"
+        hidden_channels = phone_w.shape[0]
+    else:
+        version = "v2"
+        hidden_channels = 192
+
+    # F0 conditioning
+    f0 = 1 if "enc_p.emb_pitch.weight" in state_dict else 0
+
+    # Speaker embedding
+    emb_g = state_dict.get("emb_g.weight")
+    spk_embed_dim = emb_g.shape[0] if emb_g is not None else 109
+    gin_channels = emb_g.shape[1] if emb_g is not None else 256
+
+    # inter_channels from flow pre (half_channels = inter//2)
+    flow_pre = state_dict.get("flow.flows.0.pre.weight")
+    inter_channels = (flow_pre.shape[1] * 2) if flow_pre is not None else 192
+
+    # Upsample kernel sizes — from ups.X.weight_v or ups.X.weight
+    ups_ks = []
+    for i in range(8):
+        key = f"dec.ups.{i}.weight_v" if f"dec.ups.{i}.weight_v" in state_dict else f"dec.ups.{i}.weight"
+        wv = state_dict.get(key)
+        if wv is None:
+            break
+        ups_ks.append(wv.shape[2])
+
+    n_ups = len(ups_ks)
+    if n_ups == 5:
+        sr_int = 48000
+        upsample_rates = [10, 6, 2, 2, 2]
+    else:
+        sr_int = 40000
+        upsample_rates = [10, 10, 2, 2]
+        ups_ks = ups_ks[:4]  # ensure 4 entries
+
+    # upsample_initial_channel from conv_pre
+    cp_key = "dec.conv_pre.weight_v" if "dec.conv_pre.weight_v" in state_dict else "dec.conv_pre.weight"
+    cp = state_dict.get(cp_key)
+    upsample_initial_channel = cp.shape[0] if cp is not None else 512
+
+    # Infer window_size from relative attention embeddings
+    rel_k = state_dict.get("enc_p.encoder.attn_layers.0.emb_rel_k")
+    window_size = (rel_k.shape[1] - 1) // 2 if rel_k is not None else 4
+
+    # Infer flow WN n_layers from cond_layer bias: 2 * hidden_channels * n_layers
+    cond_bias = state_dict.get("flow.flows.0.enc.cond_layer.bias")
+    if cond_bias is not None and hidden_channels > 0:
+        flow_n_layers = cond_bias.shape[0] // (2 * hidden_channels)
+    else:
+        flow_n_layers = 4
+
+    config = [
+        1025, 32, inter_channels, hidden_channels, 768,
+        2, 6, 3, 0, "1",
+        [3, 7, 11], [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+        upsample_rates, upsample_initial_channel, ups_ks,
+        spk_embed_dim, gin_channels, sr_int
+    ]
+    return {
+        "version": version, "f0": f0, "sr": sr_int, "config": config,
+        "window_size": window_size, "flow_n_layers": flow_n_layers,
+    }
+
+
+def load_rvc_model(path: str, device: str = "cpu"):
+    """
+    Load a .pth or .safetensors RVC model.
+    Auto-detects v1/v2, sample rate, and F0 conditioning.
+    Returns (model, sr_int, version, f0).
+    """
+    path = str(path)
+    is_safetensors = path.endswith(".safetensors")
+
+    extra_kwargs = {}
+
+    if is_safetensors:
+        from safetensors.torch import load_file
+        raw = load_file(path, device="cpu")
+        info = infer_config_from_state_dict(raw)
+        version = info["version"]
+        f0 = info["f0"]
+        sr_int = info["sr"]
+        cfg = info["config"]
+        extra_kwargs = {"window_size": info["window_size"], "flow_n_layers": info["flow_n_layers"]}
+    else:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        if isinstance(checkpoint, dict) and "config" in checkpoint:
+            cfg = checkpoint["config"]
+            version = checkpoint.get("version", "v1")
+            f0 = checkpoint.get("f0", 1)
+            sr_str = checkpoint.get("sr", "40k")
+            raw = checkpoint.get("weight", checkpoint)
+            sr_map = {"16k": 16000, "32k": 32000, "40k": 40000, "48k": 48000}
+            sr_int = sr_map.get(str(sr_str), 40000)
+            if isinstance(cfg[-1], str):
+                cfg = list(cfg[:-1]) + [sr_int]
+            # Also infer window_size and flow_n_layers from actual weights
+            info = infer_config_from_state_dict(raw)
+            extra_kwargs = {"window_size": info["window_size"], "flow_n_layers": info["flow_n_layers"]}
+        else:
+            raw = checkpoint if isinstance(checkpoint, dict) else checkpoint
+            info = infer_config_from_state_dict(raw)
+            version = info["version"]
+            f0 = info["f0"]
+            sr_int = info["sr"]
+            cfg = info["config"]
+            extra_kwargs = {"window_size": info["window_size"], "flow_n_layers": info["flow_n_layers"]}
+
+    # Compose weight_norm params into plain weights
+    state_dict = compose_weight_norm(raw)
+
+    # Build model
+    if version == "v1":
+        model_cls = SynthesizerTrnMs256NSFsid if f0 else SynthesizerTrnMs256NSFsid_nono
+    else:
+        model_cls = SynthesizerTrnMs768NSFsid if f0 else SynthesizerTrnMs768NSFsid_nono
+
+    net_g = model_cls(*cfg, **extra_kwargs)
+    missing, unexpected = net_g.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"  Warning: {len(missing)} missing keys (normal for some formats)")
     net_g.eval().to(device)
 
     return net_g, sr_int, version, f0
