@@ -1,0 +1,11 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+transformers>=4.40.0
+sounddevice
+gradio>=6.0.0
+huggingface_hub
+librosa
+soundfile
+numpy
+scipy
+faiss-cpu

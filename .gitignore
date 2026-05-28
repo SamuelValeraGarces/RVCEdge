@@ -1,0 +1,10 @@
+models/
+base_models/
+__pycache__/
+*.pyc
+*.pth
+*.pt
+*.index
+*.npy
+.env
+*.log
