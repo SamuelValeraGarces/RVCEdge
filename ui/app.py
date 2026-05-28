@@ -65,7 +65,7 @@ def parse_device_id(s: str) -> int:
 # ── Tab 1: Real-time ───────────────────────────────────────────────────────────
 
 def load_model(pth_path: str, index_path: str, pitch: float,
-               index_rate: float, protect: float, sid: int) -> str:
+               index_rate: float, protect: float, sid: int, vad: float) -> str:
     if not pth_path or not Path(pth_path).exists():
         return "Select a valid .pth model file."
     try:
@@ -74,11 +74,12 @@ def load_model(pth_path: str, index_path: str, pitch: float,
         eng.index_rate = index_rate
         eng.protect = protect
         eng.sid = sid
+        eng.vad_threshold = vad
         idx = None if index_path == "None" else index_path
         eng.load_model(pth_path, index_path=idx)
         return (f"Model loaded: {Path(pth_path).name}\n"
                 f"Version: {eng.model_version} | SR: {eng.model_sr}Hz | "
-                f"Pitch: {pitch:+.0f}st | Device: {eng.device_str.upper()}")
+                f"Pitch: {pitch:+.0f}st | VAD: {vad:.3f}")
     except Exception as e:
         return f"Error: {e}"
 
@@ -211,6 +212,8 @@ def build_ui():
                                                    label="Index rate (0=off, 1=full similarity)")
                         protect_sl = gr.Slider(0, 0.5, value=0.33, step=0.01,
                                                label="Protect consonants (0.33 recommended)")
+                        vad_sl = gr.Slider(0.001, 0.05, value=0.012, step=0.001,
+                                           label="VAD threshold (silence gate — raise if noise bleeds through)")
                         sid_nb = gr.Number(value=0, label="Speaker ID (usually 0)", precision=0)
 
                         load_btn = gr.Button("Load model", variant="primary")
@@ -245,7 +248,7 @@ def build_ui():
 
                 refresh_btn.click(do_refresh, outputs=[pth_dd, idx_dd])
                 load_btn.click(load_model,
-                               inputs=[pth_dd, idx_dd, pitch_sl, index_rate_sl, protect_sl, sid_nb],
+                               inputs=[pth_dd, idx_dd, pitch_sl, index_rate_sl, protect_sl, sid_nb, vad_sl],
                                outputs=load_status)
                 start_btn.click(start_stream,
                                 inputs=[in_dev, out_dev, wasapi_cb],

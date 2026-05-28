@@ -73,7 +73,8 @@ class RVCEdgeEngine:
                  pitch_shift: float = 0.0,
                  index_rate: float = 0.75,
                  protect: float = 0.33,
-                 sid: int = 0):
+                 sid: int = 0,
+                 vad_threshold: float = 0.012):
 
         self.device_str = ("cuda" if torch.cuda.is_available() else "cpu") if device == "auto" else device
         self.device = torch.device(self.device_str)
@@ -81,6 +82,7 @@ class RVCEdgeEngine:
         self.index_rate = index_rate
         self.protect = protect
         self.sid = sid
+        self.vad_threshold = vad_threshold  # RMS below this = silence passthrough
 
         self.net_g = None
         self.model_sr = None
@@ -193,6 +195,12 @@ class RVCEdgeEngine:
         """
         if not self.is_ready:
             return samples_16k
+
+        # VAD: silence gate — skip conversion, output silence
+        rms = float(np.sqrt(np.mean(samples_16k ** 2)))
+        if rms < self.vad_threshold:
+            self._last_audio = None  # reset crossfade state on silence
+            return np.zeros(len(samples_16k), dtype=np.float32)
 
         audio_model_sr = self.convert_audio(samples_16k)
 
