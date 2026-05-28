@@ -31,17 +31,15 @@ def download_rmvpe():
     print(f"rmvpe.pt saved to {dest}")
 
 
-def pre_cache_contentvec():
-    """Pre-download ContentVec so first inference isn't slow."""
-    print("Pre-caching ContentVec model (lengyue233/content-vec-best)...")
-    print("This downloads ~360MB on first run.")
+def pre_cache_hubert():
+    """Pre-download HuBERT base model so first inference isn't slow."""
+    print("Pre-caching HuBERT model (facebook/hubert-base-ls960, ~360MB)...")
     try:
         from transformers import HubertModel, Wav2Vec2FeatureExtractor
-        Wav2Vec2FeatureExtractor.from_pretrained("lengyue233/content-vec-best")
-        HubertModel.from_pretrained("lengyue233/content-vec-best")
-        print("ContentVec cached.")
+        HubertModel.from_pretrained("facebook/hubert-base-ls960")
+        print("HuBERT cached.")
     except Exception as e:
-        print(f"ContentVec pre-cache failed: {e}")
+        print(f"HuBERT pre-cache failed: {e}")
         print("It will download automatically on first inference.")
 
 
@@ -54,7 +52,7 @@ if __name__ == "__main__":
 
     download_rmvpe()
     if not args.skip_contentvec:
-        pre_cache_contentvec()
+        pre_cache_hubert()
 
     print("\nBase models ready.")
     print(f"Files in {BASE_DIR.resolve()}:")

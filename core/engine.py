@@ -119,15 +119,18 @@ class RVCEdgeEngine:
 
         t0 = time.perf_counter()
 
-        # 1. ContentVec features
+        # 1. ContentVec features at ~50fps (16kHz / 320 hop)
+        import contextlib
         with (torch.autocast(device_type=self.device.type) if self.use_autocast
-              else __import__("contextlib").nullcontext()):
+              else contextlib.nullcontext()):
             feats = extract_features(audio_16k, version=self.model_version,
-                                     device=self.device_str)  # [1, T, 768]
+                                     device=self.device_str)  # [1, T_50fps, 768]
 
-        # 2. Upsample features to match model SR
-        # Feature rate: ~50fps (16kHz / 320 hop)
-        # Target rate: model_sr / hop_size (varies)
+        # 2. Repeat frames 50fps → 100fps (VITS was trained expecting 100fps)
+        # HuBERT: 320-sample hop at 16kHz = 50fps
+        # VITS upsample factor 400 for 40kHz assumes 100fps input → 100fps = 2× repeat
+        feats = feats.repeat_interleave(2, dim=1)  # [1, T*2, 768]
+
         n_frames = feats.shape[1]
         feats_np = feats.squeeze(0).float().cpu().numpy()
 
