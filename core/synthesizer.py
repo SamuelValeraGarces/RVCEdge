@@ -326,6 +326,7 @@ class TextEncoder768(nn.Module):
 
 
 class WN(nn.Module):
+    """WaveNet-style residual block — plain convs (no weight_norm)."""
     def __init__(self, hidden_channels, kernel_size, dilation_rate, n_layers,
                  gin_channels=0, p_dropout=0):
         super().__init__()
@@ -337,19 +338,17 @@ class WN(nn.Module):
         self.res_skip_layers = nn.ModuleList()
 
         if gin_channels != 0:
-            self.cond_layer = weight_norm(
-                nn.Conv1d(gin_channels, 2 * hidden_channels * n_layers, 1)
-            )
+            self.cond_layer = nn.Conv1d(gin_channels, 2 * hidden_channels * n_layers, 1)
 
         for i in range(n_layers):
             dilation = dilation_rate ** i
             padding = int((kernel_size * dilation - dilation) / 2)
-            self.in_layers.append(weight_norm(
+            self.in_layers.append(
                 nn.Conv1d(hidden_channels, 2 * hidden_channels, kernel_size,
                           dilation=dilation, padding=padding)
-            ))
+            )
             res_skip_ch = 2 * hidden_channels if i < n_layers - 1 else hidden_channels
-            self.res_skip_layers.append(weight_norm(nn.Conv1d(hidden_channels, res_skip_ch, 1)))
+            self.res_skip_layers.append(nn.Conv1d(hidden_channels, res_skip_ch, 1))
 
     def forward(self, x, x_mask, g=None, **kwargs):
         output = torch.zeros_like(x)
@@ -373,12 +372,7 @@ class WN(nn.Module):
         return output * x_mask
 
     def remove_weight_norm(self):
-        if hasattr(self, "cond_layer"):
-            remove_weight_norm(self.cond_layer)
-        for l in self.in_layers:
-            remove_weight_norm(l)
-        for l in self.res_skip_layers:
-            remove_weight_norm(l)
+        pass  # no weight_norm applied
 
 
 class ResidualCouplingLayer(nn.Module):
